@@ -1,6 +1,8 @@
 # Codex-Claw
 
-A small Relay + Bridge service for exposing a local Codex `app-server` to a remote iPhone client.
+Codex-Claw is an openclaw-style remote client layer for Codex.
+
+It exposes a local Codex `app-server` to an iPhone client through a Relay + Bridge architecture, while adding durable agent context features such as `SOUL`, `USER`, and long-term `memory`.
 
 ## What It Does
 
@@ -10,6 +12,19 @@ A small Relay + Bridge service for exposing a local Codex `app-server` to a remo
 - supports pairing and trusted-device persistence
 - can expose the relay through Cloudflare Quick Tunnel
 - injects file-based agent memory before each turn
+
+## Openclaw Features For Codex
+
+- `SOUL.md`: durable assistant identity, style, and behavior rules
+- `USER.md`: stable user preferences and collaboration habits
+- `memory/global.md`: cross-workspace long-term memory
+- `memory/profile.md`: durable profile and preference memory
+- `memory/workspaces/<id>.md`: per-workspace project memory
+- `memory/inbox.jsonl`: durable turn-by-turn summaries
+- `memory/workspace-logs/<id>.jsonl`: workspace-specific interaction logs
+- native Codex thread import into durable memory
+
+This makes Codex-Claw closer to an openclaw-style persistent agent layer than a plain websocket proxy.
 
 ## Project Layout
 
@@ -42,6 +57,8 @@ Edit `bridge.config.json` and set:
 - `codexListenUrl`
 - `workspaces[].cwd`
 
+The first bridge run will scaffold local context files under `agent/`.
+
 ## Run
 
 Start the relay:
@@ -66,20 +83,6 @@ Optional Cloudflare Quick Tunnel:
 
 ```bash
 npm run tunnel:quick
-```
-
-## Publish To GitHub
-
-If you want to publish only this subproject, initialize Git inside `Codex-Claw` instead of the repository root:
-
-```bash
-cd Codex-Claw
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin git@github.com:YOUR_NAME/openclaw.git
-git push -u origin main
 ```
 
 The included `.gitignore` keeps local device data, pairing records, agent memory, and private config out of Git.

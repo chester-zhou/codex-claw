@@ -6,6 +6,8 @@ It lets an iPhone talk to a local Codex `app-server` through a Relay + Bridge ar
 
 Short version: this is "openclaw for Codex", with durable personality and memory instead of a stateless websocket bridge.
 
+中文说明：Codex-Claw 可以理解为 Codex 版本的 openclaw。它通过 Relay + Bridge 架构，让 iPhone 可以远程连接本地的 Codex `app-server`，同时补上 `SOUL`、`USER`、workspace memory、inbox memory 和原生 Codex 线程导入这些持久化能力，不再只是一个无状态的 websocket 转发层。
+
 ## Why People Star It
 
 - remote Codex access from iPhone

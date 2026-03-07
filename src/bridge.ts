@@ -15,6 +15,7 @@ import {
 } from "./agentMemory.js";
 import { CodexAppServerClient } from "./codexAppServerClient.js";
 import { syncNativeCodexThreads } from "./nativeCodexMemorySync.js";
+import { shouldAutoContinueTurn as shouldAutoContinueTurnForContext } from "./turnLifecycle.js";
 import {
   loadBridgeConfig,
   loadDeviceRegistry,
@@ -561,16 +562,7 @@ async function handleTurnCompleted(threadId: string): Promise<void> {
     return;
   }
 
-  await persistTurnMemory(threadId);
-  const binding = threadBindings.get(threadId);
-  if (!binding) {
-    return;
-  }
-  pushToBinding(binding, {
-    type: "chat.completed",
-    workspaceId: binding.workspaceId,
-    threadId: binding.threadId,
-  });
+  await finalizeTurn(threadId);
 }
 
 async function persistTurnMemory(threadId: string): Promise<void> {
@@ -655,15 +647,7 @@ async function handleTurnWatchdog(threadId: string): Promise<void> {
   }
 
   if (turnContext.continuationCount >= MAX_AUTO_CONTINUATIONS) {
-    const binding = threadBindings.get(threadId);
-    if (binding) {
-      pushToBinding(binding, {
-        type: "chat.status",
-        workspaceId: binding.workspaceId,
-        threadId: binding.threadId,
-        status: "任务暂时停住了，需要我再试的话你直接再发一句。",
-      });
-    }
+    await finalizeTurn(threadId, "任务暂时停住了，需要我再试的话你直接再发一句。");
     return;
   }
 
@@ -671,30 +655,7 @@ async function handleTurnWatchdog(threadId: string): Promise<void> {
 }
 
 function shouldAutoContinueTurn(turnContext: TurnMemoryContext): boolean {
-  if (turnContext.awaitingInteraction) {
-    return false;
-  }
-
-  if (turnContext.continuationCount >= MAX_AUTO_CONTINUATIONS) {
-    return false;
-  }
-
-  const assistantText = turnContext.assistantText.replace(/\s+/g, " ").trim();
-  const userText = turnContext.userText.replace(/\s+/g, " ").trim();
-
-  const promiseLike = /(我去查|我查下|我来查|我先查|我看看|我去看|让我查|稍等|正在查询|我先确认|我去搜索|我来看看)/.test(assistantText);
-  const realtimeQuery = /(天气|温度|汇率|股价|价格|航班|比分|最新|今天|现在|实时)/.test(userText);
-  const finalLike = /(结论|结果|今天|当前|已经|完成|无法|没法|未能|报错|失败|℃|°C|降水|风力|晴|阴|雨)/.test(assistantText);
-
-  if (promiseLike && !finalLike) {
-    return true;
-  }
-
-  if (realtimeQuery && !turnContext.hadToolOutput && !finalLike) {
-    return true;
-  }
-
-  return false;
+  return shouldAutoContinueTurnForContext(turnContext, MAX_AUTO_CONTINUATIONS);
 }
 
 async function continueUnfinishedTurn(threadId: string, status: string): Promise<void> {
@@ -740,6 +701,36 @@ async function continueUnfinishedTurn(threadId: string, status: string): Promise
         ].join("\n"),
       },
     ],
+  });
+}
+
+async function finalizeTurn(threadId: string, status?: string): Promise<void> {
+  const turnContext = turnMemoryContexts.get(threadId);
+  const binding = threadBindings.get(threadId);
+  if (!turnContext) {
+    return;
+  }
+
+  clearTurnWatchdog(turnContext);
+  await persistTurnMemory(threadId);
+
+  if (!binding) {
+    return;
+  }
+
+  if (status) {
+    pushToBinding(binding, {
+      type: "chat.status",
+      workspaceId: binding.workspaceId,
+      threadId: binding.threadId,
+      status,
+    });
+  }
+
+  pushToBinding(binding, {
+    type: "chat.completed",
+    workspaceId: binding.workspaceId,
+    threadId: binding.threadId,
   });
 }
 

@@ -8,7 +8,8 @@
     "bridge": "tsx src/bridge.ts",
     "pair": "tsx src/createPairingSession.ts",
     "tunnel:quick": "bash ./scripts/start-cloudflare-quick-tunnel.sh",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test test/**/*.test.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"

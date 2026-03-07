@@ -1,8 +1,39 @@
 # Codex-Claw
 
-Codex-Claw is an openclaw-style remote client layer for Codex.
+Codex-Claw is an openclaw-style mobile layer for Codex.
 
-It exposes a local Codex `app-server` to an iPhone client through a Relay + Bridge architecture, while adding durable agent context features such as `SOUL`, `USER`, and long-term `memory`.
+It lets an iPhone talk to a local Codex `app-server` through a Relay + Bridge architecture, while adding persistent agent state with `SOUL`, `USER`, workspace memory, inbox memory, and native Codex thread import.
+
+Short version: this is "openclaw for Codex", with durable personality and memory instead of a stateless websocket bridge.
+
+## Why People Star It
+
+- remote Codex access from iPhone
+- openclaw-style persistent `SOUL` and `memory`
+- per-workspace context instead of one flat global prompt
+- pairing and trusted-device flow for a single personal device
+- file-based memory that is easy to inspect, edit, and version
+- works with Cloudflare Tunnel for internet access
+
+## Good Fit
+
+- you want Codex on your Mac, but usable from your phone
+- you want a persistent agent instead of a fresh session every turn
+- you want editable local files for identity, preferences, and memory
+- you want something simpler and more hackable than a full backend stack
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["iPhone Client"] --> B["Relay"]
+    B --> C["Bridge"]
+    C --> D["Codex app-server"]
+    C --> E["SOUL.md"]
+    C --> F["USER.md"]
+    C --> G["workspace memory"]
+    C --> H["inbox + logs"]
+```
 
 ## What It Does
 
@@ -13,7 +44,7 @@ It exposes a local Codex `app-server` to an iPhone client through a Relay + Brid
 - can expose the relay through Cloudflare Quick Tunnel
 - injects file-based agent memory before each turn
 
-## Openclaw Features For Codex
+## What Makes It Openclaw-Style
 
 - `SOUL.md`: durable assistant identity, style, and behavior rules
 - `USER.md`: stable user preferences and collaboration habits
@@ -25,6 +56,29 @@ It exposes a local Codex `app-server` to an iPhone client through a Relay + Brid
 - native Codex thread import into durable memory
 
 This makes Codex-Claw closer to an openclaw-style persistent agent layer than a plain websocket proxy.
+
+## Comparison
+
+| Capability | Basic remote bridge | Codex-Claw |
+| --- | --- | --- |
+| iPhone to Codex remote access | Yes | Yes |
+| Pairing and trusted-device flow | Sometimes | Yes |
+| Durable assistant identity | No | Yes |
+| Durable user preference memory | No | Yes |
+| Per-workspace memory files | No | Yes |
+| Durable inbox and workspace logs | No | Yes |
+| Import recent native Codex threads | No | Yes |
+| Editable local text files instead of DB-only state | Rarely | Yes |
+
+## Core Files
+
+- `agent/SOUL.md`: assistant identity and style
+- `agent/USER.md`: stable user preferences
+- `agent/memory/global.md`: cross-project memory
+- `agent/memory/profile.md`: durable profile memory
+- `agent/memory/workspaces/<id>.md`: project-specific memory
+- `agent/memory/inbox.jsonl`: durable summaries after each turn
+- `agent/memory/workspace-logs/<id>.jsonl`: per-workspace logs
 
 ## Project Layout
 
@@ -58,6 +112,26 @@ Edit `bridge.config.json` and set:
 - `workspaces[].cwd`
 
 The first bridge run will scaffold local context files under `agent/`.
+
+## Quick Start
+
+Terminal 1:
+
+```bash
+npm run relay
+```
+
+Terminal 2:
+
+```bash
+RELAY_BRIDGE_TOKEN=your-secret npm run bridge -- /absolute/path/to/bridge.config.json
+```
+
+Terminal 3:
+
+```bash
+npm run pair -- /absolute/path/to/bridge.config.json
+```
 
 ## Run
 

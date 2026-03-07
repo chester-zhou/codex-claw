@@ -1,0 +1,7 @@
+node_modules/
+data/
+agent/
+dist/
+codex-remote/
+bridge.config.json
+.DS_Store

@@ -1,0 +1,17 @@
+{
+  "bridgeId": "my-mac",
+  "bridgeName": "My Mac",
+  "relayUrl": "ws://127.0.0.1:8787",
+  "relayCaPath": null,
+  "codexListenUrl": "ws://127.0.0.1:8788",
+  "workspaces": [
+    {
+      "id": "project",
+      "name": "My Project",
+      "cwd": "/absolute/path/to/project",
+      "sandbox": "workspace-write",
+      "approvalPolicy": "on-request",
+      "model": null
+    }
+  ]
+}

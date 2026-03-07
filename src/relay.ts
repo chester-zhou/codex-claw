@@ -1,7 +1,8 @@
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, createReadStream, existsSync } from "node:fs";
+import path from "node:path";
 
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -38,9 +39,76 @@ const server = tlsCertPath && tlsKeyPath
   ? createHttpsServer({
       cert: readFileSync(tlsCertPath),
       key: readFileSync(tlsKeyPath),
-    })
-  : createHttpServer();
+    }, handleHttpRequest)
+  : createHttpServer(handleHttpRequest);
 const wss = new WebSocketServer({ server });
+
+function handleHttpRequest(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): void {
+  if (!req.url) {
+    res.writeHead(404).end();
+    return;
+  }
+
+  const requestURL = new URL(req.url, `${tlsCertPath && tlsKeyPath ? "https" : "http"}://${host}:${port}`);
+  if (requestURL.pathname !== "/bridge-image") {
+    res.writeHead(404).end("Not found");
+    return;
+  }
+
+  const rawPath = requestURL.searchParams.get("path");
+  if (!rawPath) {
+    res.writeHead(400).end("Missing path");
+    return;
+  }
+
+  const resolvedPath = path.resolve(rawPath);
+  if (!isAllowedImagePath(resolvedPath) || !existsSync(resolvedPath)) {
+    res.writeHead(403).end("Forbidden");
+    return;
+  }
+
+  const contentType = imageContentType(resolvedPath);
+  if (!contentType) {
+    res.writeHead(415).end("Unsupported file type");
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+  });
+  createReadStream(resolvedPath).pipe(res);
+}
+
+function isAllowedImagePath(filePath: string): boolean {
+  const allowedRoots = [
+    "/Users/chesterzhou/Documents",
+    "/Users/chesterzhou/Desktop",
+    "/var/folders",
+    "/tmp",
+  ];
+  return allowedRoots.some((root) => filePath.startsWith(root + path.sep) || filePath === root);
+}
+
+function imageContentType(filePath: string): string | null {
+  switch (path.extname(filePath).toLowerCase()) {
+  case ".png":
+    return "image/png";
+  case ".jpg":
+  case ".jpeg":
+    return "image/jpeg";
+  case ".gif":
+    return "image/gif";
+  case ".webp":
+    return "image/webp";
+  case ".bmp":
+    return "image/bmp";
+  case ".heic":
+    return "image/heic";
+  default:
+    return null;
+  }
+}
 
 wss.on("connection", (socket) => {
   let initialized = false;

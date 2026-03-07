@@ -62,6 +62,10 @@ export type AppClientMessage =
       text: string;
     }
   | {
+      type: "chat.newThread";
+      workspaceId: string;
+    }
+  | {
       type: "chat.interrupt";
       threadId: string;
     }
@@ -124,6 +128,11 @@ export type AppServerMessage =
       type: "chat.thread";
       workspaceId: string;
       threadId: string;
+    }
+  | {
+      type: "chat.reset";
+      workspaceId: string;
+      message: string;
     }
   | {
       type: "chat.user";

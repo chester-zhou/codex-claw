@@ -83,6 +83,7 @@ const pairingSessionsPath = path.resolve(configDirectory, "data/pairing-sessions
 const sessions = new Map<string, AppSession>();
 const threadBindings = new Map<string, ThreadBinding>();
 const workspaceThreads = new Map<string, string>();
+const threadTurnCounts = new Map<string, number>();
 const deviceActiveWorkspaces = new Map<string, string>();
 const pendingInteractions = new Map<string, PendingInteraction>();
 const turnDiffs = new Map<string, string>();
@@ -92,6 +93,7 @@ const pendingCommandDeltas = new Map<string, { binding: ThreadBinding; itemId: s
 let deltaFlushTimer: NodeJS.Timeout | null = null;
 const WATCHDOG_DELAY_MS = 12_000;
 const MAX_AUTO_CONTINUATIONS = 2;
+const MAX_TURNS_PER_THREAD = 10;
 
 let devices: PairedDeviceRecord[] = [];
 let bridgeSocket: WebSocket | null = null;
@@ -121,9 +123,6 @@ codex.on("request", (request) => {
 });
 await codex.start();
 void runNativeMemorySync();
-setInterval(() => {
-  void runNativeMemorySync();
-}, 60_000);
 
 void connectRelay();
 
@@ -330,6 +329,10 @@ async function handleAppMessage(connectionId: string, payload: AppClientMessage)
     requireAuthenticated(session);
     await sendChatMessage(session, connectionId, payload.workspaceId, payload.text);
     return;
+  case "chat.newThread":
+    requireAuthenticated(session);
+    resetWorkspaceThread(session, connectionId, payload.workspaceId);
+    return;
   case "chat.interrupt":
     requireAuthenticated(session);
     await codex.request("turn/interrupt", { threadId: payload.threadId });
@@ -425,6 +428,11 @@ async function sendChatMessage(
   session.activeWorkspaceId = workspaceId;
   rememberSessionWorkspace(session);
 
+  if (threadId && (threadTurnCounts.get(threadId) ?? 0) >= MAX_TURNS_PER_THREAD) {
+    retireThread(workspaceThreadKey, threadId);
+    threadId = undefined;
+  }
+
   if (!threadId) {
     const response = await codex.request<{ thread: { id: string } }>("thread/start", {
       cwd: workspace.cwd,
@@ -436,6 +444,7 @@ async function sendChatMessage(
 
     threadId = response.thread.id;
     workspaceThreads.set(workspaceThreadKey, threadId);
+    threadTurnCounts.set(threadId, 0);
     threadBindings.set(threadId, { workspaceId, threadId, deviceId, connectionId });
     push(connectionId, {
       type: "chat.thread",
@@ -450,6 +459,8 @@ async function sendChatMessage(
       binding.connectionId = connectionId;
     }
   }
+
+  threadTurnCounts.set(threadId, (threadTurnCounts.get(threadId) ?? 0) + 1);
 
   push(connectionId, {
     type: "chat.user",
@@ -481,6 +492,23 @@ async function sendChatMessage(
         text: await buildAgentPrompt(agentPaths, workspace, text),
       },
     ],
+  });
+}
+
+function resetWorkspaceThread(session: AppSession, connectionId: string, workspaceId: string): void {
+  requireWorkspace(workspaceId);
+  const deviceId = requireDeviceId(session);
+  const workspaceThreadKey = `${deviceId}:${workspaceId}`;
+  const threadId = workspaceThreads.get(workspaceThreadKey);
+
+  if (threadId) {
+    retireThread(workspaceThreadKey, threadId);
+  }
+
+  push(connectionId, {
+    type: "chat.reset",
+    workspaceId,
+    message: "已开始新对话，旧线程已退休。",
   });
 }
 
@@ -647,7 +675,7 @@ async function handleTurnWatchdog(threadId: string): Promise<void> {
   }
 
   if (turnContext.continuationCount >= MAX_AUTO_CONTINUATIONS) {
-    await finalizeTurn(threadId, "任务暂时停住了，需要我再试的话你直接再发一句。");
+    await finalizeTurn(threadId, "任务暂时停住了，已重置到新线程；你直接再发一句即可继续。");
     return;
   }
 
@@ -732,6 +760,25 @@ async function finalizeTurn(threadId: string, status?: string): Promise<void> {
     workspaceId: binding.workspaceId,
     threadId: binding.threadId,
   });
+
+  if (status?.includes("已重置到新线程")) {
+    retireThread(`${binding.deviceId}:${binding.workspaceId}`, threadId);
+  }
+}
+
+function retireThread(workspaceThreadKey: string, threadId: string): void {
+  if (workspaceThreads.get(workspaceThreadKey) === threadId) {
+    workspaceThreads.delete(workspaceThreadKey);
+  }
+  threadBindings.delete(threadId);
+  threadTurnCounts.delete(threadId);
+  turnMemoryContexts.delete(threadId);
+  pendingInteractions.forEach((pending, requestId) => {
+    if (pending.payload.threadId === threadId) {
+      pendingInteractions.delete(requestId);
+    }
+  });
+  clearTurnDiffs(threadId);
 }
 
 async function runNativeMemorySync(): Promise<void> {

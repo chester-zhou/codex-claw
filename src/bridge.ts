@@ -56,8 +56,14 @@ type ThreadBinding = {
 
 type TurnMemoryContext = {
   workspaceId: string;
+  deviceId: string;
   userText: string;
   assistantText: string;
+  hadToolOutput: boolean;
+  awaitingInteraction: boolean;
+  lastProgressAt: number;
+  continuationCount: number;
+  watchdogTimer: NodeJS.Timeout | null;
 };
 
 type PendingInteraction = {
@@ -80,6 +86,11 @@ const deviceActiveWorkspaces = new Map<string, string>();
 const pendingInteractions = new Map<string, PendingInteraction>();
 const turnDiffs = new Map<string, string>();
 const turnMemoryContexts = new Map<string, TurnMemoryContext>();
+const pendingAssistantDeltas = new Map<string, { binding: ThreadBinding; itemId: string; text: string }>();
+const pendingCommandDeltas = new Map<string, { binding: ThreadBinding; itemId: string; text: string }>();
+let deltaFlushTimer: NodeJS.Timeout | null = null;
+const WATCHDOG_DELAY_MS = 12_000;
+const MAX_AUTO_CONTINUATIONS = 2;
 
 let devices: PairedDeviceRecord[] = [];
 let bridgeSocket: WebSocket | null = null;
@@ -388,7 +399,13 @@ async function handleAppMessage(connectionId: string, payload: AppClientMessage)
       break;
     }
 
+    const resumedThreadId = pending.payload.threadId;
     pendingInteractions.delete(payload.requestId);
+    const turnContext = turnMemoryContexts.get(resumedThreadId);
+    if (turnContext) {
+      turnContext.awaitingInteraction = false;
+      touchTurnProgress(resumedThreadId, false);
+    }
     return;
   }
   }
@@ -443,9 +460,16 @@ async function sendChatMessage(
 
   turnMemoryContexts.set(threadId, {
     workspaceId,
+    deviceId,
     userText: text,
     assistantText: "",
+    hadToolOutput: false,
+    awaitingInteraction: false,
+    lastProgressAt: Date.now(),
+    continuationCount: 0,
+    watchdogTimer: null,
   });
+  scheduleTurnWatchdog(threadId);
 
   await codex.request("turn/start", {
     threadId,
@@ -472,11 +496,12 @@ function handleCodexNotification(method: string, params: unknown): void {
     if (!binding) {
       return;
     }
+    touchTurnProgress(payload.threadId, false);
     pushToBinding(binding, {
       type: "chat.status",
       workspaceId: binding.workspaceId,
       threadId: binding.threadId,
-      status: payload.status.type,
+      status: localizedThreadStatus(payload.status.type, payload.status.activeFlags ?? []),
     });
     break;
   }
@@ -490,13 +515,8 @@ function handleCodexNotification(method: string, params: unknown): void {
     if (turnContext) {
       turnContext.assistantText += payload.delta;
     }
-    pushToBinding(binding, {
-      type: "chat.assistantDelta",
-      workspaceId: binding.workspaceId,
-      threadId: binding.threadId,
-      itemId: payload.itemId,
-      delta: payload.delta,
-    });
+    touchTurnProgress(payload.threadId, false);
+    queueDelta(pendingAssistantDeltas, binding, payload.itemId, payload.delta);
     break;
   }
   case "item/commandExecution/outputDelta": {
@@ -505,33 +525,52 @@ function handleCodexNotification(method: string, params: unknown): void {
     if (!binding) {
       return;
     }
-    pushToBinding(binding, {
-      type: "chat.commandDelta",
-      workspaceId: binding.workspaceId,
-      threadId: binding.threadId,
-      itemId: payload.itemId,
-      delta: payload.delta,
-    });
+    touchTurnProgress(payload.threadId, true);
+    queueDelta(pendingCommandDeltas, binding, payload.itemId, payload.delta);
     break;
   }
   case "turn/completed": {
     const payload = params as { threadId: string };
     const binding = threadBindings.get(payload.threadId);
+    flushQueuedDeltasForThread(payload.threadId);
     clearTurnDiffs(payload.threadId);
-    void persistTurnMemory(payload.threadId);
+    void handleTurnCompleted(payload.threadId);
     if (!binding) {
       return;
     }
-    pushToBinding(binding, {
-      type: "chat.completed",
-      workspaceId: binding.workspaceId,
-      threadId: binding.threadId,
-    });
     break;
   }
   default:
     break;
   }
+}
+
+async function handleTurnCompleted(threadId: string): Promise<void> {
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext) {
+    return;
+  }
+
+  clearTurnWatchdog(turnContext);
+  if (turnContext.awaitingInteraction) {
+    return;
+  }
+
+  if (shouldAutoContinueTurn(turnContext)) {
+    await continueUnfinishedTurn(threadId, "上一轮还没真正完成，我继续把结果查完。");
+    return;
+  }
+
+  await persistTurnMemory(threadId);
+  const binding = threadBindings.get(threadId);
+  if (!binding) {
+    return;
+  }
+  pushToBinding(binding, {
+    type: "chat.completed",
+    workspaceId: binding.workspaceId,
+    threadId: binding.threadId,
+  });
 }
 
 async function persistTurnMemory(threadId: string): Promise<void> {
@@ -540,6 +579,7 @@ async function persistTurnMemory(threadId: string): Promise<void> {
     return;
   }
 
+  clearTurnWatchdog(turnContext);
   turnMemoryContexts.delete(threadId);
   const workspace = config.workspaces.find((item) => item.id === turnContext.workspaceId);
   if (!workspace) {
@@ -554,6 +594,153 @@ async function persistTurnMemory(threadId: string): Promise<void> {
       assistantText: turnContext.assistantText,
     }),
   );
+}
+
+function scheduleTurnWatchdog(threadId: string): void {
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext) {
+    return;
+  }
+
+  clearTurnWatchdog(turnContext);
+  turnContext.watchdogTimer = setTimeout(() => {
+    void handleTurnWatchdog(threadId);
+  }, WATCHDOG_DELAY_MS);
+}
+
+function clearTurnWatchdog(turnContext: TurnMemoryContext): void {
+  if (!turnContext.watchdogTimer) {
+    return;
+  }
+  clearTimeout(turnContext.watchdogTimer);
+  turnContext.watchdogTimer = null;
+}
+
+function touchTurnProgress(threadId: string, hadToolOutput: boolean): void {
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext) {
+    return;
+  }
+
+  turnContext.lastProgressAt = Date.now();
+  if (hadToolOutput) {
+    turnContext.hadToolOutput = true;
+  }
+
+  if (!turnContext.awaitingInteraction) {
+    scheduleTurnWatchdog(threadId);
+  }
+}
+
+function markAwaitingInteraction(threadId: string): void {
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext) {
+    return;
+  }
+
+  turnContext.awaitingInteraction = true;
+  turnContext.lastProgressAt = Date.now();
+  clearTurnWatchdog(turnContext);
+}
+
+async function handleTurnWatchdog(threadId: string): Promise<void> {
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext || turnContext.awaitingInteraction) {
+    return;
+  }
+
+  if (Date.now() - turnContext.lastProgressAt < WATCHDOG_DELAY_MS - 1_000) {
+    scheduleTurnWatchdog(threadId);
+    return;
+  }
+
+  if (turnContext.continuationCount >= MAX_AUTO_CONTINUATIONS) {
+    const binding = threadBindings.get(threadId);
+    if (binding) {
+      pushToBinding(binding, {
+        type: "chat.status",
+        workspaceId: binding.workspaceId,
+        threadId: binding.threadId,
+        status: "任务暂时停住了，需要我再试的话你直接再发一句。",
+      });
+    }
+    return;
+  }
+
+  await continueUnfinishedTurn(threadId, "上一轮似乎卡住了，我继续直接执行，不停在说明。");
+}
+
+function shouldAutoContinueTurn(turnContext: TurnMemoryContext): boolean {
+  if (turnContext.awaitingInteraction) {
+    return false;
+  }
+
+  if (turnContext.continuationCount >= MAX_AUTO_CONTINUATIONS) {
+    return false;
+  }
+
+  const assistantText = turnContext.assistantText.replace(/\s+/g, " ").trim();
+  const userText = turnContext.userText.replace(/\s+/g, " ").trim();
+
+  const promiseLike = /(我去查|我查下|我来查|我先查|我看看|我去看|让我查|稍等|正在查询|我先确认|我去搜索|我来看看)/.test(assistantText);
+  const realtimeQuery = /(天气|温度|汇率|股价|价格|航班|比分|最新|今天|现在|实时)/.test(userText);
+  const finalLike = /(结论|结果|今天|当前|已经|完成|无法|没法|未能|报错|失败|℃|°C|降水|风力|晴|阴|雨)/.test(assistantText);
+
+  if (promiseLike && !finalLike) {
+    return true;
+  }
+
+  if (realtimeQuery && !turnContext.hadToolOutput && !finalLike) {
+    return true;
+  }
+
+  return false;
+}
+
+async function continueUnfinishedTurn(threadId: string, status: string): Promise<void> {
+  const turnContext = turnMemoryContexts.get(threadId);
+  const binding = threadBindings.get(threadId);
+  if (!turnContext || !binding) {
+    return;
+  }
+
+  const workspace = config.workspaces.find((item) => item.id === turnContext.workspaceId);
+  if (!workspace) {
+    return;
+  }
+
+  turnContext.continuationCount += 1;
+  turnContext.lastProgressAt = Date.now();
+  turnContext.awaitingInteraction = false;
+  scheduleTurnWatchdog(threadId);
+
+  pushToBinding(binding, {
+    type: "chat.status",
+    workspaceId: binding.workspaceId,
+    threadId: binding.threadId,
+    status,
+  });
+
+  await codex.request("turn/start", {
+    threadId,
+    cwd: workspace.cwd,
+    input: [
+      {
+        type: "text",
+        text: [
+          "Continue the same user task.",
+          "The previous turn stopped before the user's goal was actually completed.",
+          "Do not say you will check later.",
+          "Directly use the necessary tools now and return the concrete result.",
+          "If blocked, say the exact blocker.",
+          "",
+          `Original user request: ${turnContext.userText}`,
+          "",
+          `Previous partial assistant reply: ${turnContext.assistantText.trim() || "(empty)"}`,
+        ].join("\n"),
+      },
+    ],
+  });
 }
 
 async function runNativeMemorySync(): Promise<void> {
@@ -589,6 +776,7 @@ function handleCodexRequest(id: number, method: string, params: unknown): void {
       codex.respond(id, { decision: "denied" });
       return;
     }
+    markAwaitingInteraction(binding.threadId);
 
     const interactionPayload: PendingInteractionMessage = {
       type: "interaction.request",
@@ -634,6 +822,7 @@ function handleCodexRequest(id: number, method: string, params: unknown): void {
       codex.respond(id, { decision: "decline" });
       return;
     }
+    markAwaitingInteraction(binding.threadId);
 
     const interactionPayload: PendingInteractionMessage = {
       type: "interaction.request",
@@ -679,6 +868,7 @@ function handleCodexRequest(id: number, method: string, params: unknown): void {
       codex.respond(id, { answers: {} });
       return;
     }
+    markAwaitingInteraction(binding.threadId);
 
     const interactionPayload: PendingInteractionMessage = {
       type: "interaction.request",
@@ -761,6 +951,109 @@ function clearTurnDiffs(threadId: string): void {
     if (key.startsWith(`${threadId}:`)) {
       turnDiffs.delete(key);
     }
+  }
+}
+
+function queueDelta(
+  target: Map<string, { binding: ThreadBinding; itemId: string; text: string }>,
+  binding: ThreadBinding,
+  itemId: string,
+  delta: string,
+): void {
+  const key = `${binding.threadId}:${itemId}`;
+  const existing = target.get(key);
+  if (existing) {
+    existing.text += delta;
+  } else {
+    target.set(key, {
+      binding: { ...binding },
+      itemId,
+      text: delta,
+    });
+  }
+  scheduleDeltaFlush();
+}
+
+function scheduleDeltaFlush(): void {
+  if (deltaFlushTimer) {
+    return;
+  }
+
+  deltaFlushTimer = setTimeout(() => {
+    deltaFlushTimer = null;
+    flushQueuedDeltas();
+  }, 120);
+}
+
+function flushQueuedDeltas(): void {
+  flushDeltaMap(pendingAssistantDeltas, "chat.assistantDelta");
+  flushDeltaMap(pendingCommandDeltas, "chat.commandDelta");
+}
+
+function flushQueuedDeltasForThread(threadId: string): void {
+  flushDeltaMapForThread(pendingAssistantDeltas, "chat.assistantDelta", threadId);
+  flushDeltaMapForThread(pendingCommandDeltas, "chat.commandDelta", threadId);
+}
+
+function flushDeltaMap(
+  source: Map<string, { binding: ThreadBinding; itemId: string; text: string }>,
+  type: "chat.assistantDelta" | "chat.commandDelta",
+): void {
+  for (const [key, value] of source) {
+    source.delete(key);
+    pushToBinding(value.binding, {
+      type,
+      workspaceId: value.binding.workspaceId,
+      threadId: value.binding.threadId,
+      itemId: value.itemId,
+      delta: value.text,
+    });
+  }
+}
+
+function flushDeltaMapForThread(
+  source: Map<string, { binding: ThreadBinding; itemId: string; text: string }>,
+  type: "chat.assistantDelta" | "chat.commandDelta",
+  threadId: string,
+): void {
+  for (const [key, value] of source) {
+    if (value.binding.threadId !== threadId) {
+      continue;
+    }
+    source.delete(key);
+    pushToBinding(value.binding, {
+      type,
+      workspaceId: value.binding.workspaceId,
+      threadId: value.binding.threadId,
+      itemId: value.itemId,
+      delta: value.text,
+    });
+  }
+}
+
+function localizedThreadStatus(type: string, activeFlags: string[]): string {
+  if (activeFlags.some((flag) => /tool|exec|command/i.test(flag))) {
+    return "调用工具中";
+  }
+
+  if (activeFlags.some((flag) => /input|approval/i.test(flag))) {
+    return "等待你确认";
+  }
+
+  switch (type) {
+  case "idle":
+    return "当前空闲";
+  case "running":
+    return "执行中";
+  case "waiting":
+    return "等待结果";
+  case "interrupted":
+    return "已中断";
+  case "errored":
+  case "error":
+    return "执行失败";
+  default:
+    return type;
   }
 }
 

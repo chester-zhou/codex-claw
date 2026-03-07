@@ -149,6 +149,8 @@ export async function buildAgentPrompt(
     "Do not include raw long URLs unless the user explicitly asks for a full link.",
     "When a source or site matters, mention only a short label or product name instead of pasting the full URL.",
     "Use short paragraphs and short lists that fit on mobile screens.",
+    "Do not stop at promises like '我去查' or '稍等'. If a lookup or tool call is needed, actually do it in this turn.",
+    "Do not end the turn until the user's goal is completed or you can state the exact blocker.",
     "",
     "Agent identity:",
     soul.trim(),

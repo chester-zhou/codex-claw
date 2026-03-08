@@ -5,3 +5,8 @@ dist/
 codex-remote/
 bridge.config.json
 .DS_Store
+output/
+xiaohongshu_assets/
+ios-app/**/xcuserdata/
+ios-app/**/*.xcuserstate
+ios-app/build/

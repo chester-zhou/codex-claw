@@ -1,6 +1,6 @@
 # Codex-Claw
 
-Codex-Claw is an openclaw-style mobile layer for Codex.
+Codex-Claw is an openclaw-style mobile layer for Codex, with the iPhone client included in this repository.
 
 It lets an iPhone talk to a local Codex `app-server` through a Relay + Bridge architecture, while adding persistent agent state with `SOUL`, `USER`, workspace memory, inbox memory, and native Codex thread import.
 
@@ -45,6 +45,7 @@ flowchart LR
 - supports pairing and trusted-device persistence
 - can expose the relay through Cloudflare Quick Tunnel
 - injects file-based agent memory before each turn
+- includes a native SwiftUI iPhone app for Codex remote chat
 
 ## What Makes It Openclaw-Style
 
@@ -90,12 +91,17 @@ This makes Codex-Claw closer to an openclaw-style persistent agent layer than a 
 - `src/agentMemory.ts`: file-based soul, user, and memory scaffolding
 - `src/nativeCodexMemorySync.ts`: imports recent Codex native threads into durable memory
 - `bridge.config.example.json`: example bridge configuration
+- `ios-app/iOSNote`: SwiftUI iPhone app source
+- `ios-app/iOSNote.xcodeproj`: Xcode project for the iPhone app
+- `ios-app/scripts/generate_app_icons.py`: app icon generator
+- `docs/CODEX_REMOTE_PLAN.md`: implementation notes for the remote architecture
 
 ## Requirements
 
 - Node.js 18+
 - `codex` CLI available in `PATH`
 - optional: `cloudflared` for internet exposure
+- Xcode 26+ for the iPhone app
 
 ## Setup
 
@@ -160,5 +166,27 @@ Optional Cloudflare Quick Tunnel:
 ```bash
 npm run tunnel:quick
 ```
+
+## iPhone App
+
+The iPhone client lives in:
+
+- `ios-app/iOSNote`
+- `ios-app/iOSNote.xcodeproj`
+
+Open the Xcode project:
+
+```bash
+open ios-app/iOSNote.xcodeproj
+```
+
+Then:
+
+- set your signing team in Xcode
+- trust the developer profile on the iPhone if needed
+- configure the app to use your Relay URL and Bridge ID
+- run on a real device for the intended experience
+
+The app product name is `Codex Claw`.
 
 The included `.gitignore` keeps local device data, pairing records, agent memory, and private config out of Git.

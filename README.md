@@ -141,31 +141,11 @@ Terminal 3:
 npm run pair -- /absolute/path/to/bridge.config.json
 ```
 
-## Run
+What you get after this:
 
-Start the relay:
-
-```bash
-npm run relay
-```
-
-Start the bridge in another terminal:
-
-```bash
-RELAY_BRIDGE_TOKEN=your-secret npm run bridge -- /absolute/path/to/bridge.config.json
-```
-
-Create a one-time pairing code:
-
-```bash
-npm run pair -- /absolute/path/to/bridge.config.json
-```
-
-Optional Cloudflare Quick Tunnel:
-
-```bash
-npm run tunnel:quick
-```
+- relay listening for app connections
+- bridge connected to local `codex app-server`
+- one-time pairing code for the iPhone app
 
 ## iPhone App
 
@@ -185,8 +165,44 @@ Then:
 - set your signing team in Xcode
 - trust the developer profile on the iPhone if needed
 - configure the app to use your Relay URL and Bridge ID
+- submit a one-time pairing code from `npm run pair`
 - run on a real device for the intended experience
 
 The app product name is `Codex Claw`.
+
+## Internet Access
+
+For internet access, expose the relay with a tunnel.
+
+Quick Tunnel:
+
+```bash
+npm run tunnel:quick
+```
+
+The app should then use the tunnel URL as:
+
+- `Relay URL`: `wss://<your-public-host>`
+- `Bridge ID`: value from `bridge.config.json`
+
+## Common Paths
+
+- iPhone app source: `ios-app/iOSNote`
+- Xcode project: `ios-app/iOSNote.xcodeproj`
+- Relay server: `src/relay.ts`
+- Bridge server: `src/bridge.ts`
+- Agent identity: `agent/SOUL.md`
+- User preferences: `agent/USER.md`
+- Workspace memory: `agent/memory/workspaces/<id>.md`
+- Durable inbox: `agent/memory/inbox.jsonl`
+
+## Repository Notes
+
+- local runtime state is intentionally ignored:
+  - `bridge.config.json`
+  - `data/`
+  - `agent/`
+- the repository includes the iOS app source, but not your local pairing records, memory logs, or private config
+- small local publishing asset directories are also ignored
 
 The included `.gitignore` keeps local device data, pairing records, agent memory, and private config out of Git.

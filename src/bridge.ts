@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import WebSocket from "ws";
 
 import {
+  appendHeartbeatReport,
   appendMemoryTurn,
   buildAgentPrompt,
   createMemoryTurnRecord,
@@ -62,8 +63,10 @@ type TurnMemoryContext = {
   assistantText: string;
   hadToolOutput: boolean;
   awaitingInteraction: boolean;
+  startedAt: number;
   lastProgressAt: number;
   continuationCount: number;
+  waitingNoticeSent: boolean;
   watchdogTimer: NodeJS.Timeout | null;
 };
 
@@ -91,12 +94,15 @@ const turnMemoryContexts = new Map<string, TurnMemoryContext>();
 const pendingAssistantDeltas = new Map<string, { binding: ThreadBinding; itemId: string; text: string }>();
 const pendingCommandDeltas = new Map<string, { binding: ThreadBinding; itemId: string; text: string }>();
 let deltaFlushTimer: NodeJS.Timeout | null = null;
-const WATCHDOG_DELAY_MS = 12_000;
+const WATCHDOG_SOFT_DELAY_MS = 20_000;
+const WATCHDOG_HARD_DELAY_MS = 45_000;
 const MAX_AUTO_CONTINUATIONS = 2;
-const MAX_TURNS_PER_THREAD = 10;
+const MAX_TURNS_PER_THREAD = 24;
+const DELTA_FLUSH_INTERVAL_MS = Number(process.env.BRIDGE_DELTA_FLUSH_MS ?? "90");
 
 let devices: PairedDeviceRecord[] = [];
 let bridgeSocket: WebSocket | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
 
 const config = await loadBridgeConfig(configPath);
 const agentPaths = await ensureAgentScaffold(configDirectory, config.workspaces);
@@ -123,6 +129,7 @@ codex.on("request", (request) => {
 });
 await codex.start();
 void runNativeMemorySync();
+startHeartbeatRunner();
 
 void connectRelay();
 
@@ -163,6 +170,18 @@ function connectRelay(): void {
     console.log("Relay connection closed, retrying in 1s");
     setTimeout(connectRelay, 1000);
   });
+}
+
+function startHeartbeatRunner(): void {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+  }
+
+  const intervalMinutes = Math.max(5, config.heartbeatIntervalMinutes ?? 30);
+  void runHeartbeatCheck();
+  heartbeatTimer = setInterval(() => {
+    void runHeartbeatCheck();
+  }, intervalMinutes * 60_000);
 }
 
 async function handleRelayMessage(message: RelayBridgeIncomingMessage): Promise<void> {
@@ -312,6 +331,9 @@ async function handleAppMessage(connectionId: string, payload: AppClientMessage)
     });
     pushWorkspaceState(connectionId, session.activeWorkspaceId);
     restoreSessionState(session, connectionId);
+    if (session.activeWorkspaceId) {
+      void preheatWorkspaceSession(session, connectionId, session.activeWorkspaceId);
+    }
     return;
   }
   case "workspace.list":
@@ -324,6 +346,12 @@ async function handleAppMessage(connectionId: string, payload: AppClientMessage)
     session.activeWorkspaceId = payload.workspaceId;
     rememberSessionWorkspace(session);
     pushWorkspaceState(connectionId, session.activeWorkspaceId);
+    void preheatWorkspaceSession(session, connectionId, payload.workspaceId);
+    return;
+  case "workspace.preheat":
+    requireAuthenticated(session);
+    requireWorkspace(payload.workspaceId);
+    void preheatWorkspaceSession(session, connectionId, payload.workspaceId);
     return;
   case "chat.send":
     requireAuthenticated(session);
@@ -421,44 +449,18 @@ async function sendChatMessage(
   workspaceId: string,
   text: string,
 ): Promise<void> {
+  const trimmedText = text.trim();
+  if (trimmedText === "/new" || trimmedText === "/reset") {
+    resetWorkspaceThread(session, connectionId, workspaceId);
+    return;
+  }
+
   const workspace = requireWorkspace(workspaceId);
   const deviceId = requireDeviceId(session);
   const workspaceThreadKey = `${deviceId}:${workspaceId}`;
-  let threadId = workspaceThreads.get(workspaceThreadKey);
   session.activeWorkspaceId = workspaceId;
   rememberSessionWorkspace(session);
-
-  if (threadId && (threadTurnCounts.get(threadId) ?? 0) >= MAX_TURNS_PER_THREAD) {
-    retireThread(workspaceThreadKey, threadId);
-    threadId = undefined;
-  }
-
-  if (!threadId) {
-    const response = await codex.request<{ thread: { id: string } }>("thread/start", {
-      cwd: workspace.cwd,
-      sandbox: workspace.sandbox,
-      approvalPolicy: workspace.approvalPolicy,
-      model: workspace.model ?? null,
-      personality: "pragmatic",
-    });
-
-    threadId = response.thread.id;
-    workspaceThreads.set(workspaceThreadKey, threadId);
-    threadTurnCounts.set(threadId, 0);
-    threadBindings.set(threadId, { workspaceId, threadId, deviceId, connectionId });
-    push(connectionId, {
-      type: "chat.thread",
-      workspaceId,
-      threadId,
-    });
-  } else if (!threadBindings.has(threadId)) {
-    threadBindings.set(threadId, { workspaceId, threadId, deviceId, connectionId });
-  } else {
-    const binding = threadBindings.get(threadId);
-    if (binding) {
-      binding.connectionId = connectionId;
-    }
-  }
+  const threadId = await ensureWorkspaceThread(session, connectionId, workspaceId);
 
   threadTurnCounts.set(threadId, (threadTurnCounts.get(threadId) ?? 0) + 1);
 
@@ -477,11 +479,13 @@ async function sendChatMessage(
     assistantText: "",
     hadToolOutput: false,
     awaitingInteraction: false,
+    startedAt: Date.now(),
     lastProgressAt: Date.now(),
     continuationCount: 0,
+    waitingNoticeSent: false,
     watchdogTimer: null,
   });
-  scheduleTurnWatchdog(threadId);
+  scheduleTurnWatchdog(threadId, WATCHDOG_SOFT_DELAY_MS);
 
   await codex.request("turn/start", {
     threadId,
@@ -616,7 +620,7 @@ async function persistTurnMemory(threadId: string): Promise<void> {
   );
 }
 
-function scheduleTurnWatchdog(threadId: string): void {
+function scheduleTurnWatchdog(threadId: string, delayMs = WATCHDOG_SOFT_DELAY_MS): void {
   const turnContext = turnMemoryContexts.get(threadId);
   if (!turnContext) {
     return;
@@ -625,7 +629,7 @@ function scheduleTurnWatchdog(threadId: string): void {
   clearTurnWatchdog(turnContext);
   turnContext.watchdogTimer = setTimeout(() => {
     void handleTurnWatchdog(threadId);
-  }, WATCHDOG_DELAY_MS);
+  }, delayMs);
 }
 
 function clearTurnWatchdog(turnContext: TurnMemoryContext): void {
@@ -648,7 +652,7 @@ function touchTurnProgress(threadId: string, hadToolOutput: boolean): void {
   }
 
   if (!turnContext.awaitingInteraction) {
-    scheduleTurnWatchdog(threadId);
+    scheduleTurnWatchdog(threadId, WATCHDOG_SOFT_DELAY_MS);
   }
 }
 
@@ -669,8 +673,17 @@ async function handleTurnWatchdog(threadId: string): Promise<void> {
     return;
   }
 
-  if (Date.now() - turnContext.lastProgressAt < WATCHDOG_DELAY_MS - 1_000) {
-    scheduleTurnWatchdog(threadId);
+  const now = Date.now();
+  const quietForMs = now - turnContext.lastProgressAt;
+  const ageMs = now - turnContext.startedAt;
+
+  if (quietForMs < WATCHDOG_SOFT_DELAY_MS - 1_000) {
+    scheduleTurnWatchdog(threadId, WATCHDOG_SOFT_DELAY_MS);
+    return;
+  }
+
+  if (ageMs < WATCHDOG_HARD_DELAY_MS) {
+    scheduleTurnWatchdog(threadId, WATCHDOG_HARD_DELAY_MS - ageMs);
     return;
   }
 
@@ -701,7 +714,8 @@ async function continueUnfinishedTurn(threadId: string, status: string): Promise
   turnContext.continuationCount += 1;
   turnContext.lastProgressAt = Date.now();
   turnContext.awaitingInteraction = false;
-  scheduleTurnWatchdog(threadId);
+  turnContext.waitingNoticeSent = false;
+  scheduleTurnWatchdog(threadId, WATCHDOG_HARD_DELAY_MS);
 
   pushToBinding(binding, {
     type: "chat.status",
@@ -781,11 +795,73 @@ function retireThread(workspaceThreadKey: string, threadId: string): void {
   clearTurnDiffs(threadId);
 }
 
+async function preheatWorkspacePrompt(workspaceId: string): Promise<void> {
+  const workspace = config.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) {
+    return;
+  }
+
+  try {
+    await buildAgentPrompt(agentPaths, workspace, "继续当前工作区的上下文。");
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function preheatWorkspaceSession(
+  session: AppSession,
+  connectionId: string,
+  workspaceId: string,
+): Promise<void> {
+  await Promise.all([
+    preheatWorkspacePrompt(workspaceId),
+    ensureWorkspaceThread(session, connectionId, workspaceId),
+  ]);
+}
+
 async function runNativeMemorySync(): Promise<void> {
   try {
     const imported = await syncNativeCodexThreads(agentPaths, config.workspaces);
     if (imported > 0) {
       console.log(`Synced ${imported} native Codex thread(s) into shared memory`);
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function runHeartbeatCheck(): Promise<void> {
+  try {
+    const now = new Date();
+    const staleTurnCount = Array.from(turnMemoryContexts.values()).filter((context) => {
+      return now.getTime() - context.startedAt > 15 * 60_000;
+    }).length;
+
+    const staleInteractionCount = pendingInteractions.size;
+    const connectedDevices = Array.from(sessions.values()).filter((session) => session.authenticated).length;
+    const relayConnected = bridgeSocket?.readyState === WebSocket.OPEN;
+    const codexConnected = codex.isConnected();
+
+    const checks = [
+      `Relay: ${relayConnected ? "connected" : "disconnected"}`,
+      `Codex app-server: ${codexConnected ? "connected" : "disconnected"}`,
+      `Authenticated devices: ${connectedDevices}`,
+      `Pending interactions: ${staleInteractionCount}`,
+      `Long-running turns (>15m): ${staleTurnCount}`,
+    ];
+
+    const summary = (!relayConnected || !codexConnected || staleTurnCount > 0)
+      ? "attention-needed"
+      : "healthy";
+
+    await appendHeartbeatReport(agentPaths, {
+      timestamp: now.toISOString(),
+      summary,
+      checks,
+    });
+
+    if (summary !== "healthy") {
+      console.log(`[heartbeat] ${summary}: ${checks.join(" | ")}`);
     }
   } catch (error) {
     console.error(error);
@@ -1020,7 +1096,7 @@ function scheduleDeltaFlush(): void {
   deltaFlushTimer = setTimeout(() => {
     deltaFlushTimer = null;
     flushQueuedDeltas();
-  }, 120);
+  }, DELTA_FLUSH_INTERVAL_MS);
 }
 
 function flushQueuedDeltas(): void {
@@ -1093,6 +1169,59 @@ function localizedThreadStatus(type: string, activeFlags: string[]): string {
   default:
     return type;
   }
+}
+
+function shouldRetireThreadBeforeNextTurn(threadId: string): boolean {
+  const turnCount = threadTurnCounts.get(threadId) ?? 0;
+  if (turnCount < MAX_TURNS_PER_THREAD) {
+    return false;
+  }
+
+  const turnContext = turnMemoryContexts.get(threadId);
+  if (!turnContext) {
+    return turnCount >= MAX_TURNS_PER_THREAD + 6;
+  }
+
+  return turnContext.continuationCount > 0 || turnCount >= MAX_TURNS_PER_THREAD + 6;
+}
+
+async function ensureWorkspaceThread(
+  session: AppSession,
+  connectionId: string,
+  workspaceId: string,
+): Promise<string> {
+  const workspace = requireWorkspace(workspaceId);
+  const deviceId = requireDeviceId(session);
+  const workspaceThreadKey = `${deviceId}:${workspaceId}`;
+  let threadId = workspaceThreads.get(workspaceThreadKey);
+
+  if (threadId && shouldRetireThreadBeforeNextTurn(threadId)) {
+    retireThread(workspaceThreadKey, threadId);
+    threadId = undefined;
+  }
+
+  if (!threadId) {
+    const response = await codex.request<{ thread: { id: string } }>("thread/start", {
+      cwd: workspace.cwd,
+      sandbox: workspace.sandbox,
+      approvalPolicy: workspace.approvalPolicy,
+      model: workspace.model ?? null,
+      personality: "pragmatic",
+    });
+
+    threadId = response.thread.id;
+    workspaceThreads.set(workspaceThreadKey, threadId);
+    threadTurnCounts.set(threadId, 0);
+  }
+
+  const existingBinding = threadBindings.get(threadId);
+  if (existingBinding) {
+    existingBinding.connectionId = connectionId;
+  } else {
+    threadBindings.set(threadId, { workspaceId, threadId, deviceId, connectionId });
+  }
+
+  return threadId;
 }
 
 function pushWorkspaceState(connectionId: string, activeWorkspaceId: string | null): void {

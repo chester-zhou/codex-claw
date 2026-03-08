@@ -60,6 +60,8 @@ export class CodexAppServerClient extends EventEmitter {
       "codex",
       [
         "app-server",
+        "-c",
+        "model_reasoning_effort=low",
         "--listen",
         this.listenUrl,
       ],
@@ -124,6 +126,10 @@ export class CodexAppServerClient extends EventEmitter {
         result,
       }),
     ));
+  }
+
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
   }
 
   private async initialize(): Promise<void> {

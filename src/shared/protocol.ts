@@ -57,6 +57,10 @@ export type AppClientMessage =
       workspaceId: string;
     }
   | {
+      type: "workspace.preheat";
+      workspaceId: string;
+    }
+  | {
       type: "chat.send";
       workspaceId: string;
       text: string;

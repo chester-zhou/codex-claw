@@ -9,6 +9,7 @@ export type BridgeConfig = {
   relayUrl: string;
   relayCaPath?: string | null;
   codexListenUrl: string;
+  heartbeatIntervalMinutes?: number;
   workspaces: WorkspaceDescriptor[];
 };
 
